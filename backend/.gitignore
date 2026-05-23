@@ -17,14 +17,34 @@ yarn-error.log*
 .env.local
 .env.*.local
 
+# ======================
+# WHATSAPP BOT (BAILEYS SESSION) - IMPORTANT
+# ======================
+auth_info_*/
+auth_info_*
+auth_info*/
+**/auth_info_*/
+**/auth_info_*
+session*/
+sessions*/
+*.json
+backend/auth_info_1/
+
+
+# ======================
 # OS files
+# ======================
 .DS_Store
 
+# ======================
 # IDE
+# ======================
 .vscode/
 .idea/
 
+# ======================
 # Runtime
+# ======================
 *.pid
 *.seed
 *.pid.lock
