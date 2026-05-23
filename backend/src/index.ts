@@ -19,63 +19,69 @@ console.log("🔑 GROQ LOADED:", !!process.env.GROQ_API_KEY);
 // GROQ CLIENT
 // ======================
 const groq = new Groq({
-    apiKey: process.env.GROQ_API_KEY!
+    apiKey: process.env.GROQ_API_KEY
 });
 
 // ======================
-// SIMPLE CACHE (hemat token)
+// CACHE
 // ======================
-const cache = new Map<string, string>();
+const cache = new Map();
 
 // ======================
-// AI FUNCTION (FANDO PERSONA)
+// GUARDS
 // ======================
-async function askAI(text: string) {
+const activeBots = new Set();
+const reconnecting = new Set();
+const qrShown = new Set();
+
+// ======================
+// SLEEP
+// ======================
+function sleep(ms) {
+    return new Promise(res => setTimeout(res, ms));
+}
+
+// ======================
+// QUEUE SYSTEM (INI YANG BARU)
+// ======================
+const queues = new Map();
+// key: instanceId, value: Promise chain
+
+function enqueue(instanceId, task) {
+    const prev = queues.get(instanceId) || Promise.resolve();
+
+    const next = prev
+        .catch(() => { }) // jangan putus chain kalau error
+        .then(() => task());
+
+    queues.set(instanceId, next);
+
+    return next;
+}
+
+// ======================
+// AI FUNCTION
+// ======================
+async function askAI(text) {
     try {
         console.log("📤 SEND TO AI:", text);
 
-        if (cache.has(text)) {
-            console.log("⚡ CACHE HIT");
-            return cache.get(text)!;
-        }
+        if (cache.has(text)) return cache.get(text);
 
         const res = await groq.chat.completions.create({
             model: "llama-3.1-8b-instant",
-
             messages: [
                 {
                     role: "system",
                     content: `
-Kamu adalah "Fando", seorang asisten WhatsApp yang membantu percakapan.
+Kamu adalah "Fando", asisten WhatsApp.
 
-IDENTITAS:
-- Nama kamu Fando
-- Kamu bukan AI umum
-- Kamu adalah asisten chat yang santai dan natural
-
-ATURAN PENTING:
-- Selalu jawab sebagai Fando (gunakan sudut pandang "aku" sebagai Fando)
-- Jangan menyebut diri sebagai AI
-- Jangan menjelaskan sistem atau teknologi
-- Jangan meniru nama user
-- Jangan membalas dengan mengulang nama user secara aneh
-- Jawab singkat, santai, dan natural
-
-GAYA BICARA:
-- Santai seperti teman chat
-- Tidak formal berlebihan
-- Tidak panjang
-- Kadang pakai emoji ringan (max 1–2)
-
-CONTOH:
-User: Halo
-Fando: Halo juga 👋
-
-User: lagi apa?
-Fando: Lagi santai aja nih 😄
-
-User: bantu aku
-Fando: Siap, mau dibantu apa?
+ATURAN:
+- Santai, natural
+- Jawab singkat
+- Gunakan bahasa user
+- Jangan menyebut AI
+- Maks 1 emoji
                     `.trim()
                 },
                 {
@@ -83,9 +89,8 @@ Fando: Siap, mau dibantu apa?
                     content: text
                 }
             ],
-
-            temperature: 0.7,
-            max_tokens: 120
+            temperature: 0.8,
+            max_tokens: 60
         });
 
         const reply =
@@ -93,29 +98,33 @@ Fando: Siap, mau dibantu apa?
             "lagi error dikit 😅";
 
         cache.set(text, reply);
-
-        console.log("🤖 AI RESPONSE OK");
-
         return reply;
 
     } catch (err) {
         console.log("❌ AI ERROR:", err);
-        return "lagi error dikit 😅";
+
+        // silent fail (tidak spam user)
+        return null;
     }
 }
 
 // ======================
 // START BOT
 // ======================
-async function startBot() {
+async function startBot(instanceId) {
+
+    if (activeBots.has(instanceId)) return;
+    activeBots.add(instanceId);
+
+    const authFolder = `auth_info_${instanceId}`;
 
     const { state, saveCreds } =
-        await useMultiFileAuthState("auth_info");
+        await useMultiFileAuthState(authFolder);
 
     const sock = makeWASocket({
         auth: state,
         logger: P({ level: "silent" }),
-        printQRInTerminal: true
+        printQRInTerminal: false
     });
 
     // ======================
@@ -125,28 +134,34 @@ async function startBot() {
 
         const { connection, qr, lastDisconnect } = update;
 
-        if (qr) {
+        if (qr && !qrShown.has(instanceId) && !reconnecting.has(instanceId)) {
+            qrShown.add(instanceId);
+            console.log(`📱 QR UMKM ${instanceId}`);
             qrcode.generate(qr, { small: true });
-            console.log("📱 Scan QR WhatsApp");
         }
 
         if (connection === "open") {
-            console.log("✅ BOT CONNECTED");
+            console.log(`✅ CONNECTED UMKM ${instanceId}`);
+            qrShown.delete(instanceId);
+            reconnecting.delete(instanceId);
         }
 
         if (connection === "close") {
 
-            const code =
-                (lastDisconnect?.error as any)?.output?.statusCode;
+            const code = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = code !== DisconnectReason.loggedOut;
 
-            const shouldReconnect =
-                code !== DisconnectReason.loggedOut;
+            console.log(`❌ CLOSED UMKM ${instanceId}`);
 
-            console.log("❌ CONNECTION CLOSED");
+            if (shouldReconnect && !reconnecting.has(instanceId)) {
 
-            if (shouldReconnect) {
-                console.log("🔄 RECONNECTING...");
-                startBot();
+                reconnecting.add(instanceId);
+
+                setTimeout(() => {
+                    activeBots.delete(instanceId);
+                    qrShown.delete(instanceId);
+                    startBot(instanceId);
+                }, 8000);
             }
         }
     });
@@ -154,16 +169,15 @@ async function startBot() {
     sock.ev.on("creds.update", saveCreds);
 
     // ======================
-    // MESSAGE HANDLER
+    // MESSAGE HANDLER (QUEUE + HUMAN DELAY)
     // ======================
     sock.ev.on("messages.upsert", async ({ messages }) => {
 
         const msg = messages?.[0];
         if (!msg?.message) return;
-
         if (msg.key.fromMe) return;
 
-        const from = msg.key.remoteJid!;
+        const from = msg.key.remoteJid;
 
         const text =
             msg.message.conversation ||
@@ -174,19 +188,45 @@ async function startBot() {
 
         if (!text) return;
 
-        console.log("📥 USER:", text);
+        console.log(`📥 USER ${instanceId}:`, text);
 
-        const reply = await askAI(text);
+        // ======================
+        // INI QUEUE (PENTING)
+        // ======================
+        enqueue(instanceId, async () => {
 
-        console.log("🤖 REPLY:", reply);
+            const reply = await askAI(text);
 
-        await sock.sendMessage(from, {
-            text: reply
+            if (!reply) {
+                console.log("⚠️ AI FAIL (silent)");
+                return;
+            }
+
+            // HUMAN DELAY (biar natural)
+            const delay =
+                Math.floor(Math.random() * 4000) + 2000; // 2–6 detik
+
+            console.log(`⏳ delay: ${delay}ms`);
+            await sleep(delay);
+
+            console.log(`🤖 BOT ${instanceId}:`, reply);
+
+            await sock.sendMessage(from, {
+                text: reply
+            });
         });
     });
 }
 
 // ======================
-// RUN
+// RUN MULTI BOT
 // ======================
-startBot();
+async function runAllBots() {
+
+    for (let i = 1; i <= 10; i++) {
+        startBot(i);
+        await sleep(2500);
+    }
+}
+
+runAllBots();
